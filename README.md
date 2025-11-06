@@ -1,4 +1,8 @@
 # @e280/kimura
+<p align="center">
+  <img src="assets/kimura.png" width="600px" alt="Kimura wireframe">
+</p>
+
 
  Tool for interactively editing the transformation matrices of pixi objects.
 
@@ -48,5 +52,5 @@ app.stage.addChild(new Kimura({
 ```
 
 <p align="center">
-<img src="https://i.imgur.com/b82qYjF.png" width="790px" />
+<img src="https://i.imgur.com/b82qYjF.png" width="100%" />
 </p>
