@@ -30,7 +30,7 @@ export class Kimura extends Container {
 	#startAngle = 0
 	#angle = 0
 
-	constructor(opts: {group: Container[]}) {
+	constructor(private opts: {group: Container[], centeredScaling?: boolean}) {
 		super()
 		this.group = opts.group
 		this.eventMode = 'static'
@@ -100,46 +100,66 @@ export class Kimura extends Container {
 		if (this.parent) this.position.copyFrom(this.parent.toLocal(this.#pivot))
 		this.rotation = this.#angle
 		const ob = this.#computeOrientedLocalBounds()
-		this.#opBounds.set(0, 0, ob.width, ob.height)
-		const px = corner.includes('l') ? ob.x + ob.width : ob.x
-		const py = corner.includes('t') ? ob.y + ob.height : ob.y
-		const pivotWorld = this.toGlobal(new Point(px, py))
+		this.#opBounds.copyFrom(ob)
+		let pivotLocalX: number
+		let pivotLocalY: number
+		if (this.opts.centeredScaling) {
+			pivotLocalX = ob.x + ob.width / 2
+			pivotLocalY = ob.y + ob.height / 2
+		} else {
+			pivotLocalX = corner.includes('l') ? ob.x + ob.width : ob.x
+			pivotLocalY = corner.includes('t') ? ob.y + ob.height : ob.y
+		}
+		const pivotWorld = this.toGlobal(new Point(pivotLocalX, pivotLocalY))
 		this.#pivot.copyFrom(pivotWorld)
-	}
+  }
 
-	#scale(corner: Corner, global: Point) {
-    const p = this.toLocal(global)
-      
-    const newW = corner.includes('l') ? -p.x : p.x
-    const newH = corner.includes('t') ? -p.y : p.y
-    
-    const scaleX = this.#opBounds.width ? newW / this.#opBounds.width : 1
-    const scaleY = this.#opBounds.height ? newH / this.#opBounds.height : 1
-    
-    const pivotWorld = this.#pivot
-    const angle = this.#angle
+  #scale(corner: Corner, global: Point) {
+		const p = this.toLocal(global)
+		const pivotLocal = this.toLocal(this.#pivot)
 
-    for (const c of this.group) {
-      const start = this.#childStart.get(c)!
-      const parent = c.parent
-      if (!parent) continue
-      const parentInv = parent.worldTransform.clone().invert()
+		let scaleX = 1
+		let scaleY = 1
 
-      // We must rotate, scale, and rotate back around the pivot
-      const worldDelta = TMP.delta.identity()
-        .translate(-pivotWorld.x, -pivotWorld.y) // 1. Move pivot to origin
-        .rotate(-angle)                          // 2. Un-rotate to align with world axes
-        .scale(scaleX, scaleY)                   // 3. Scale along aligned axes
-        .rotate(angle)                           // 4. Re-rotate to original angle
-        .translate(pivotWorld.x, pivotWorld.y)   // 5. Move pivot back
+		if (this.opts.centeredScaling) {
+			const cornerX = corner.includes('l') ? this.#opBounds.x : this.#opBounds.x + this.#opBounds.width
+			const cornerY = corner.includes('t') ? this.#opBounds.y : this.#opBounds.y + this.#opBounds.height
+			const origDistX = cornerX - pivotLocal.x
+			const origDistY = cornerY - pivotLocal.y
+			const newDistX = p.x - pivotLocal.x
+			const newDistY = p.y - pivotLocal.y
+			scaleX = origDistX ? newDistX / origDistX : 1
+			scaleY = origDistY ? newDistY / origDistY : 1
+		} else {
+			const newW = corner.includes('l') ? pivotLocal.x - p.x : p.x - pivotLocal.x
+			const newH = corner.includes('t') ? pivotLocal.y - p.y : p.y - pivotLocal.y
+			scaleX = this.#opBounds.width ? newW / this.#opBounds.width : 1
+			scaleY = this.#opBounds.height ? newH / this.#opBounds.height : 1
+		}
 
-      const startWorld = start.clone().append(parent.worldTransform)
-      const newWorld = worldDelta.clone().append(startWorld)
-      const newLocal = parentInv.clone().append(newWorld)
-      c.setFromMatrix(newLocal)
-    }
+		const pivotWorld = this.#pivot
+		const angle = this.#angle
 
-    this.#refresh()
+		for (const c of this.group) {
+  		const start = this.#childStart.get(c)!
+  		const parent = c.parent
+  		if (!parent) continue
+  		const parentInv = parent.worldTransform.clone().invert()
+
+  		const worldDelta = TMP.delta.identity()
+				.translate(-pivotWorld.x, -pivotWorld.y)
+				.rotate(-angle)
+				.scale(scaleX, scaleY)
+				.rotate(angle)
+				.translate(pivotWorld.x, pivotWorld.y)
+
+  		const startWorld = start.clone().append(parent.worldTransform)
+  		const newWorld = worldDelta.clone().append(startWorld)
+  		const newLocal = parentInv.clone().append(newWorld)
+  		c.setFromMatrix(newLocal)
+		}
+
+		this.#refresh()
   }
 
 	#beginRotateDrag(start: Point) {
