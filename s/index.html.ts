@@ -28,7 +28,7 @@ export default ssg.page(import.meta.url, async orb => ({
 
 	body: html`
 		<section>
-			<h1>Omnitool <small>v${orb.packageVersion()}</small></h1>
+			<h1>Kimura <small>v${orb.packageVersion()}</small></h1>
 		</section>
 	`,
 }))
