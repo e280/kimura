@@ -1,11 +1,12 @@
 import {Graphics, Rectangle} from 'pixi.js'
 
-import {Kimura} from '../kimura.js'
-
 export class Wireframe extends Graphics {
-	constructor(private kimura: Kimura) {
-		super()
-	}
+
+  constructor() {
+    super()
+		this.eventMode = 'static'
+		this.cursor = 'move'
+  }
 
 	draw(bounds: Rectangle) {
 		const color = 0x55c1ff
