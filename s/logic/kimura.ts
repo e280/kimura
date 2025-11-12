@@ -4,206 +4,208 @@ import {
 	FederatedPointerEvent,
 	Rectangle,
 	Matrix,
-	Ticker
+	Ticker,
+	Graphics
 } from 'pixi.js'
 
 import {Wireframe} from './parts/wireframe.js'
-import {Corner, Handle} from './parts/handle.js'
+import {HandleKind, Handle, Side} from './parts/handle.js'
 
 const TMP = {
 	delta: new Matrix(),
 	newLocal: new Matrix()
 }
 
+const isSide = (h: string): h is Side => h.startsWith('m')
+
 export class Kimura extends Container {
 	group: Container[]
 	wireframe = new Wireframe()
-	activeHandle: string | null = null
 	isDragging = false
 	lastPointer = new Point()
-	activeTarget: Container | null = null
+	activeHandle: HandleKind | null = null
 
 	#handles: Record<string, Handle>
 	#childStart = new Map<Container, Matrix>()
-	#opBounds = new Rectangle()
-	#pivot = new Point()
-	#startAngle = 0
+	#pivotWorld = new Point()
 	#angle = 0
+	#startAngle = 0
+
+	#opBounds = new Rectangle()
+	#scalePivotLocal = new Point()
+
+	#unclippedLocal = new Rectangle()    // scaled-but-not-cropped max
+	#unclippedAtOp = new Rectangle()     // snapshot at op begin
+	#clippedLocal = new Rectangle()      // current crop
+
+	#maskG = new Graphics()
+	#minClipW = 1
+	#minClipH = 1
 
 	constructor(private opts: {group: Container[], centeredScaling?: boolean}) {
 		super()
 		this.group = opts.group
 		this.eventMode = 'static'
 
-		const callbacks = {
-			beginDrag: (corner: Corner, start: Point) => this.#beginHandleDrag(corner, start),
-			updateDrag: (corner: Corner, pos: Point) => this.#scale(corner, pos),
+		const cb = {
+			beginDrag: (h: HandleKind, s: Point) => this.#beginHandleDrag(h, s),
+			updateDrag: (h: HandleKind, p: Point) => this.#updateDrag(h, p),
 			endDrag: () => this.#endDrag()
 		}
 
 		this.#handles = {
-			tl: new Handle('tl', 'nwse-resize', callbacks),
-			tr: new Handle('tr', 'nesw-resize', callbacks),
-			bl: new Handle('bl', 'nesw-resize', callbacks),
-			br: new Handle('br', 'nwse-resize', callbacks),
+			tl: new Handle('tl', 'nwse-resize', cb),
+			tr: new Handle('tr', 'nesw-resize', cb),
+			bl: new Handle('bl', 'nesw-resize', cb),
+			br: new Handle('br', 'nwse-resize', cb),
+			ml: new Handle('ml', 'ew-resize', cb),
+			mr: new Handle('mr', 'ew-resize', cb),
+			mt: new Handle('mt', 'ns-resize', cb),
+			mb: new Handle('mb', 'ns-resize', cb),
 			rot: new Handle('rot', 'crosshair', {
-				beginDrag: (_corner, start) => this.#beginRotateDrag(start),
-				updateDrag: (_corner, pos) => this.#rotate(pos),
+				beginDrag: (_c, s) => this.#beginRotateDrag(s),
+				updateDrag: (_c, p) => this.#rotate(p),
 				endDrag: () => this.#endDrag()
 			})
 		}
 
-		this.addChild(this.wireframe)
-		for (const h of Object.values(this.#handles)) this.addChild(h)
-
+		this.addChild(this.wireframe, this.#maskG, ...Object.values(this.#handles))
 		this.#bindEvents()
-		Ticker.shared.addOnce(() => this.#refresh())
+		Ticker.shared.addOnce(() => this.#initBounds())
 	}
 
 	#bindEvents() {
-		this.on('pointerdown', this.#onPointerDown)
-		this.on('pointerup', this.#onPointerUp)
-		this.on('pointerupoutside', this.#onPointerUp)
-		this.on('globalpointermove', this.#onPointerMove)
+		this.on('pointerdown', this.#onDown)
+		this.on('pointerup', this.#onUp)
+		this.on('pointerupoutside', this.#onUp)
+		this.on('globalpointermove', this.#onMove)
 	}
 
-	#onPointerDown = (e: FederatedPointerEvent) => {
+	#initBounds() {
+		const ob = this.#computeWorldAABB()
+		this.#pivotWorld.set(ob.x + ob.width / 2, ob.y + ob.height / 2)
+
+		const local = new Rectangle(-ob.width / 2, -ob.height / 2, ob.width, ob.height)
+		this.#unclippedLocal.copyFrom(local)
+		this.#clippedLocal.copyFrom(local)
+
+		this.#refresh()
+	}
+
+	#onDown = (e: FederatedPointerEvent) => {
 		this.isDragging = true
 		this.lastPointer.copyFrom(e.global)
 		this.cursor = 'grabbing'
 	}
 
-	#onPointerUp = () => {
+	#onUp = () => {
 		this.isDragging = false
 		this.activeHandle = null
 		this.cursor = 'default'
 	}
 
-	#onPointerMove = (e: FederatedPointerEvent) => {
-		if (!this.isDragging || !this.parent) return
+	#onMove = (e: FederatedPointerEvent) => {
+		if (!this.isDragging || this.activeHandle || !this.parent) return
+
+		const from = this.parent.toLocal(this.lastPointer)
+		const to = this.parent.toLocal(e.global)
+		const dx = to.x - from.x
+		const dy = to.y - from.y
+
 		for (const obj of this.group) {
-			const parent = obj.parent
-			if (!parent) continue
-			const localStart = parent.toLocal(this.lastPointer)
-			const localNow = parent.toLocal(e.global)
-			obj.position.x += localNow.x - localStart.x
-			obj.position.y += localNow.y - localStart.y
+			obj.x += dx
+			obj.y += dy
 		}
+
+		this.#pivotWorld.x += dx
+		this.#pivotWorld.y += dy
+
 		this.lastPointer.copyFrom(e.global)
 		this.#refresh()
 	}
 
-	#beginHandleDrag(corner: Corner, _start: Point) {
+	#beginHandleDrag(handle: HandleKind, _start: Point) {
 		this.isDragging = true
+		this.activeHandle = handle
 		this.#childStart.clear()
-		for (const c of this.group) this.#childStart.set(c, c.localTransform.clone())
-		if (this.parent) this.position.copyFrom(this.parent.toLocal(this.#pivot))
+
+		for (const c of this.group)
+			this.#childStart.set(c, c.localTransform.clone())
+
 		this.rotation = this.#angle
-		const ob = this.#computeOrientedLocalBounds()
-		this.#opBounds.copyFrom(ob)
-		let pivotLocalX: number
-		let pivotLocalY: number
-		if (this.opts.centeredScaling) {
-			pivotLocalX = ob.x + ob.width / 2
-			pivotLocalY = ob.y + ob.height / 2
-		} else {
-			pivotLocalX = corner.includes('l') ? ob.x + ob.width : ob.x
-			pivotLocalY = corner.includes('t') ? ob.y + ob.height : ob.y
-		}
-		const pivotWorld = this.toGlobal(new Point(pivotLocalX, pivotLocalY))
-		this.#pivot.copyFrom(pivotWorld)
-  }
+		this.#opBounds.copyFrom(this.#clippedLocal)
+		this.#unclippedAtOp.copyFrom(this.#unclippedLocal)
 
-  #scale(corner: Corner, global: Point) {
+		if (!isSide(handle))
+			this.#setScalePivot(handle)
+	}
+
+	#updateDrag(handle: HandleKind, pos: Point) {
+		if (isSide(handle)) this.#clipEdge(handle, pos)
+		else this.#scale(handle, pos)
+	}
+
+	#scale(handle: HandleKind, global: Point) {
+		const pivotLocal = this.#scalePivotLocal
+		const proposed = this.#proposeScaledRect(handle, this.toLocal(global), pivotLocal, this.#opBounds)
+
+		const sx = proposed.width / this.#opBounds.width
+		const sy = proposed.height / this.#opBounds.height
+		const pivotWorld = this.toGlobal(pivotLocal)
+
+		this.#applyWorldDelta(this.#deltaScale(pivotWorld, this.#angle, sx, sy))
+
+		this.#unclippedLocal.copyFrom(this.#scaleRectAbout(this.#unclippedAtOp, pivotLocal, sx, sy))
+		this.#setCrop(proposed)
+	}
+
+	#clipEdge(handle: Side, global: Point) {
 		const p = this.toLocal(global)
-		const pivotLocal = this.toLocal(this.#pivot)
+		const s = this.#clippedLocal
 
-		let scaleX = 1
-		let scaleY = 1
-
-		if (this.opts.centeredScaling) {
-			const cornerX = corner.includes('l') ? this.#opBounds.x : this.#opBounds.x + this.#opBounds.width
-			const cornerY = corner.includes('t') ? this.#opBounds.y : this.#opBounds.y + this.#opBounds.height
-			const origDistX = cornerX - pivotLocal.x
-			const origDistY = cornerY - pivotLocal.y
-			const newDistX = p.x - pivotLocal.x
-			const newDistY = p.y - pivotLocal.y
-			scaleX = origDistX ? newDistX / origDistX : 1
-			scaleY = origDistY ? newDistY / origDistY : 1
-		} else {
-			const newW = corner.includes('l') ? pivotLocal.x - p.x : p.x - pivotLocal.x
-			const newH = corner.includes('t') ? pivotLocal.y - p.y : p.y - pivotLocal.y
-			scaleX = this.#opBounds.width ? newW / this.#opBounds.width : 1
-			scaleY = this.#opBounds.height ? newH / this.#opBounds.height : 1
+		// mutate s in place
+		if (handle === 'ml') {
+			const right = s.x + s.width
+			const newLeft = Math.min(p.x, right - this.#minClipW)
+			s.width = right - newLeft
+			s.x = newLeft
+		} else if (handle === 'mr') {
+			s.width = Math.max(this.#minClipW, p.x - s.x)
+		} else if (handle === 'mt') {
+			const bottom = s.y + s.height
+			const newTop = Math.min(p.y, bottom - this.#minClipH)
+			s.height = bottom - newTop
+			s.y = newTop
+		} else { // mb
+			s.height = Math.max(this.#minClipH, p.y - s.y)
 		}
 
-		const pivotWorld = this.#pivot
-		const angle = this.#angle
-
-		for (const c of this.group) {
-  		const start = this.#childStart.get(c)!
-  		const parent = c.parent
-  		if (!parent) continue
-  		const parentInv = parent.worldTransform.clone().invert()
-
-  		const worldDelta = TMP.delta.identity()
-				.translate(-pivotWorld.x, -pivotWorld.y)
-				.rotate(-angle)
-				.scale(scaleX, scaleY)
-				.rotate(angle)
-				.translate(pivotWorld.x, pivotWorld.y)
-
-  		const startWorld = start.clone().append(parent.worldTransform)
-  		const newWorld = worldDelta.clone().append(startWorld)
-  		const newLocal = parentInv.clone().append(newWorld)
-  		c.setFromMatrix(newLocal)
-		}
-
+		this.#clampRectToMax(s, this.#unclippedLocal)
 		this.#refresh()
-  }
+	}
 
 	#beginRotateDrag(start: Point) {
 		this.isDragging = true
+		this.activeHandle = 'rot'
 		this.#childStart.clear()
-		for (const c of this.group) this.#childStart.set(c, c.localTransform.clone())
-		const b = this.#computeWorldAABB()
-		const pivotWorld = new Point(b.x + b.width / 2, b.y + b.height / 2)
-		this.#pivot.copyFrom(pivotWorld)
-		const local = this.toLocal(start)
-		const pivotLocal = this.toLocal(this.#pivot)
-		this.#startAngle = Math.atan2(local.y - pivotLocal.y, local.x - pivotLocal.x)
+		for (const c of this.group)
+			this.#childStart.set(c, c.localTransform.clone())
+		this.#startAngle = Math.atan2(start.y - this.#pivotWorld.y, start.x - this.#pivotWorld.x)
 	}
 
 	#rotate(global: Point) {
-		const local = this.toLocal(global)
-		const pivotLocal = this.toLocal(this.#pivot)
-		const current = Math.atan2(local.y - pivotLocal.y, local.x - pivotLocal.x)
-		const da = current - this.#startAngle
-		const liveAngle = this.#angle + da
-		const pivotWorld = this.#pivot
-		for (const c of this.group) {
-			const start = this.#childStart.get(c)!
-			const parent = c.parent
-			if (!parent) continue
-			const parentInv = parent.worldTransform.clone().invert()
-			const worldDelta = TMP.delta.identity()
-				.translate(-pivotWorld.x, -pivotWorld.y)
-				.rotate(da)
-				.translate(pivotWorld.x, pivotWorld.y)
-			const startWorld = start.clone().append(parent.worldTransform)
-			const newWorld = worldDelta.clone().append(startWorld)
-			const newLocal = parentInv.clone().append(newWorld)
-			c.setFromMatrix(newLocal)
-		}
-		if (this.parent) this.position.copyFrom(this.parent.toLocal(this.#pivot))
-		this.rotation = liveAngle
-		this.#refresh(liveAngle)
+		const now = Math.atan2(global.y - this.#pivotWorld.y, global.x - this.#pivotWorld.x)
+		const da = now - this.#startAngle
+		const live = this.#angle + da
+		this.#applyWorldDelta(this.#deltaRotate(this.#pivotWorld, da))
+		this.rotation = live
+		this.#refresh(live)
 	}
 
 	#endDrag() {
 		this.isDragging = false
 		this.#angle = this.rotation
-		if (this.parent) this.position.copyFrom(this.parent.toLocal(this.#pivot))
+		this.activeHandle = null
 		this.#refresh(this.#angle)
 	}
 
@@ -219,40 +221,137 @@ export class Kimura extends Container {
 		return new Rectangle(minX, minY, maxX - minX, maxY - minY)
 	}
 
-	#computeOrientedLocalBounds() {
-		let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
-		const worldToLocal = this.worldTransform.clone().invert()
-		for (const obj of this.group) {
-			const wt = obj.worldTransform
-			const b = obj.getLocalBounds()
-			const corners = [
-				new Point(b.x, b.y),
-				new Point(b.x + b.width, b.y),
-				new Point(b.x + b.width, b.y + b.height),
-				new Point(b.x, b.y + b.height)
-			]
-			for (const p of corners) {
-				const pw = wt.apply(p)
-				const pv = worldToLocal.apply(pw)
-				minX = Math.min(minX, pv.x)
-				minY = Math.min(minY, pv.y)
-				maxX = Math.max(maxX, pv.x)
-				maxY = Math.max(maxY, pv.y)
-			}
-		}
-		return new Rectangle(minX, minY, maxX - minX, maxY - minY)
-	}
-
 	#refresh(angle: number = this.#angle) {
-		if (this.parent) this.position.copyFrom(this.parent.toLocal(this.#pivot))
+		if (this.parent) this.position.copyFrom(this.parent.toLocal(this.#pivotWorld))
 		this.rotation = angle
-		const r = this.#computeOrientedLocalBounds()
+
+		const r = this.#clippedLocal
 		this.wireframe.draw(r)
+
+		const cx = r.x + r.width / 2
+		const cy = r.y + r.height / 2
+
 		this.#handles.tl.position.set(r.x, r.y)
 		this.#handles.tr.position.set(r.x + r.width, r.y)
 		this.#handles.bl.position.set(r.x, r.y + r.height)
 		this.#handles.br.position.set(r.x + r.width, r.y + r.height)
-		const cx = r.x + r.width / 2
+
+		this.#handles.ml.position.set(r.x, cy)
+		this.#handles.mr.position.set(r.x + r.width, cy)
+		this.#handles.mt.position.set(cx, r.y)
+		this.#handles.mb.position.set(cx, r.y + r.height)
 		this.#handles.rot.position.set(cx, r.y - 30)
+
+		this.#maskG.clear()
+		this.#maskG.beginFill(0xffffff)
+		this.#maskG.drawRect(r.x, r.y, r.width, r.height)
+		this.#maskG.endFill()
+
+		for (const o of this.group)
+			o.mask = this.#maskG
+	}
+
+	// helpers
+
+	#setScalePivot(handle: HandleKind) {
+		const s = this.#opBounds
+		if (this.opts.centeredScaling) {
+			this.#scalePivotLocal.set(s.x + s.width / 2, s.y + s.height / 2)
+			return
+		}
+		if (handle === 'tl') this.#scalePivotLocal.set(s.x + s.width, s.y + s.height)
+		else if (handle === 'tr') this.#scalePivotLocal.set(s.x, s.y + s.height)
+		else if (handle === 'bl') this.#scalePivotLocal.set(s.x + s.width, s.y)
+		else this.#scalePivotLocal.set(s.x, s.y)
+	}
+
+	#proposeScaledRect(handle: HandleKind, p: Point, pivot: Point, start: Rectangle) {
+		if (this.opts.centeredScaling) {
+			const w = Math.max(this.#minClipW, Math.abs(p.x - pivot.x) * 2)
+			const h = Math.max(this.#minClipH, Math.abs(p.y - pivot.y) * 2)
+			return new Rectangle(pivot.x - w / 2, pivot.y - h / 2, w, h)
+		}
+		if (handle === 'tl') {
+			const left = Math.min(p.x, pivot.x - this.#minClipW)
+			const top = Math.min(p.y, pivot.y - this.#minClipH)
+			return new Rectangle(left, top, pivot.x - left, pivot.y - top)
+		}
+		if (handle === 'tr') {
+			const right = Math.max(p.x, pivot.x + this.#minClipW)
+			const top = Math.min(p.y, pivot.y - this.#minClipH)
+			return new Rectangle(pivot.x, top, right - pivot.x, pivot.y - top)
+		}
+		if (handle === 'bl') {
+			const left = Math.min(p.x, pivot.x - this.#minClipW)
+			const bottom = Math.max(p.y, pivot.y + this.#minClipH)
+			return new Rectangle(left, pivot.y, pivot.x - left, bottom - pivot.y)
+		}
+		const right = Math.max(p.x, pivot.x + this.#minClipW)
+		const bottom = Math.max(p.y, pivot.y + this.#minClipH)
+		return new Rectangle(pivot.x, pivot.y, right - pivot.x, bottom - pivot.y)
+	}
+
+	#scaleRectAbout(src: Rectangle, pivot: Point, sx: number, sy: number) {
+		const left = pivot.x + (src.x - pivot.x) * sx
+		const top = pivot.y + (src.y - pivot.y) * sy
+		const right = pivot.x + (src.x + src.width - pivot.x) * sx
+		const bottom = pivot.y + (src.y + src.height - pivot.y) * sy
+		const x = Math.min(left, right)
+		const y = Math.min(top, bottom)
+		const w = Math.max(this.#minClipW, Math.abs(right - left))
+		const h = Math.max(this.#minClipH, Math.abs(bottom - top))
+		return new Rectangle(x, y, w, h)
+	}
+
+	#deltaScale(pivotWorld: Point, angle: number, sx: number, sy: number) {
+		return TMP.delta.identity()
+			.translate(-pivotWorld.x, -pivotWorld.y)
+			.rotate(-angle)
+			.scale(sx, sy)
+			.rotate(angle)
+			.translate(pivotWorld.x, pivotWorld.y)
+	}
+
+	#deltaRotate(pivotWorld: Point, da: number) {
+		return TMP.delta.identity()
+			.translate(-pivotWorld.x, -pivotWorld.y)
+			.rotate(da)
+			.translate(pivotWorld.x, pivotWorld.y)
+	}
+
+	#applyWorldDelta(worldDelta: Matrix) {
+		for (const c of this.group) {
+			const start = this.#childStart.get(c)
+			const parent = c.parent
+			if (!start || !parent) continue
+			const parentInv = parent.worldTransform.clone().invert()
+			const startWorld = start.clone().append(parent.worldTransform)
+			const newWorld = worldDelta.clone().append(startWorld)
+			const newLocal = parentInv.clone().append(newWorld)
+			c.setFromMatrix(newLocal)
+		}
+	}
+
+	#setCrop(r: Rectangle) {
+		this.#clippedLocal.copyFrom(r)
+		this.#clampRectToMax(this.#clippedLocal, this.#unclippedLocal)
+		this.#refresh()
+	}
+
+	#clampRectToMax(s: Rectangle, max: Rectangle) {
+		if (s.x < max.x) {
+			const d = max.x - s.x
+			s.x = max.x
+			s.width = Math.max(this.#minClipW, s.width - d)
+		}
+		if (s.y < max.y) {
+			const d = max.y - s.y
+			s.y = max.y
+			s.height = Math.max(this.#minClipH, s.height - d)
+		}
+		const maxRight = max.x + max.width
+		if (s.x + s.width > maxRight) s.width = Math.max(this.#minClipW, maxRight - s.x)
+		const maxBottom = max.y + max.height
+		if (s.y + s.height > maxBottom) s.height = Math.max(this.#minClipH, maxBottom - s.y)
 	}
 }

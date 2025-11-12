@@ -1,9 +1,11 @@
 import {FederatedPointerEvent, Graphics, Point} from "pixi.js"
 
-export type Corner = 'tl' | 'tr' | 'bl' | 'br' | 'rot'
+export type Side = 'ml' | 'mr' | 'mt' | 'mb'
+type Corner = 'tl' | 'tr' | 'bl' | 'br' | 'rot'
+export type HandleKind = Corner | Side
 interface Callbacks {
-	beginDrag: (corner: Corner, start: Point) => void
-	updateDrag: (corner: Corner, pos: Point) => void
+	beginDrag: (handle: HandleKind, start: Point) => void
+	updateDrag: (handle: HandleKind, pos: Point) => void
 	endDrag: () => void
 }
 
@@ -11,7 +13,7 @@ export class Handle extends Graphics {
 	#isDragging = false
 
 	constructor(
-		private corner: Corner,
+		private handle: HandleKind,
 		public cursor: string,
 		private callbacks: Callbacks
 	) {
@@ -34,13 +36,13 @@ export class Handle extends Graphics {
 	#onDown = (e: FederatedPointerEvent) => {
 		this.#isDragging = true
 		this.cursor = 'grabbing'
-		this.callbacks.beginDrag(this.corner, e.global)
+		this.callbacks.beginDrag(this.handle, e.global)
 		e.stopPropagation()
 	}
 
 	#onMove = (e: FederatedPointerEvent) => {
 		if (!this.#isDragging) return
-		this.callbacks.updateDrag(this.corner, e.global)
+		this.callbacks.updateDrag(this.handle, e.global)
 		e.stopPropagation()
 	}
 
